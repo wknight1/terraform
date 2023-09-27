@@ -5,6 +5,7 @@ package configs
 
 import (
 	"fmt"
+	"path"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/gohcl"
@@ -28,6 +29,12 @@ type Provider struct {
 	Config hcl.Body
 
 	DeclRange hcl.Range
+
+	// Mock is true if the provider should load a mocked version of itself
+	// instead of the real thing. Data contains the parsed data that this mocked
+	// provider will return in place of a normal call to the provider.
+	Mock bool
+	Data *MockData
 
 	// TODO: this may not be set in some cases, so it is not yet suitable for
 	// use outside of this package. We currently only use it for internal
@@ -60,6 +67,9 @@ func decodeProviderBlock(block *hcl.Block) (*Provider, hcl.Diagnostics) {
 		NameRange: block.LabelRanges[0],
 		Config:    config,
 		DeclRange: block.DefRange,
+
+		// We'll just be explicit and mark this as not a mock.
+		Mock: false,
 	}
 
 	if attr, exists := content.Attributes["alias"]; exists {
@@ -132,6 +142,85 @@ func decodeProviderBlock(block *hcl.Block) (*Provider, hcl.Diagnostics) {
 				Detail:   fmt.Sprintf("The block type name %q is reserved for use by Terraform in a future version.", block.Type),
 				Subject:  &block.TypeRange,
 			})
+		}
+	}
+
+	return provider, diags
+}
+
+func decodeMockProviderBlock(p *Parser, dir string, block *hcl.Block) (*Provider, hcl.Diagnostics) {
+	var diags hcl.Diagnostics
+
+	content, config, moreDiags := block.Body.PartialContent(mockBlockSchema)
+	diags = append(diags, moreDiags...)
+
+	// Provider names must be localized. Produce an error with a message
+	// indicating the action the user can take to fix this message if the local
+	// name is not localized.
+	name := block.Labels[0]
+	nameDiags := checkProviderNameNormalized(name, block.DefRange)
+	diags = append(diags, nameDiags...)
+	if nameDiags.HasErrors() {
+		// If the name is invalid then we mustn't produce a result because
+		// downstreams could try to use it as a provider type and then crash.
+		return nil, diags
+	}
+
+	provider := &Provider{
+		Name:      name,
+		NameRange: block.LabelRanges[0],
+		DeclRange: block.DefRange,
+
+		// Mark this provider as being mocked.
+		Mock: true,
+	}
+
+	if attr, exists := content.Attributes["alias"]; exists {
+		valDiags := gohcl.DecodeExpression(attr.Expr, nil, &provider.Alias)
+		diags = append(diags, valDiags...)
+		provider.AliasRange = attr.Expr.Range().Ptr()
+
+		if !hclsyntax.ValidIdentifier(provider.Alias) {
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid provider configuration alias",
+				Detail:   fmt.Sprintf("An alias must be a valid name. %s", badIdentifierDetail),
+			})
+		}
+	}
+
+	// We will also load the mocked data now.
+
+	data, dataDiags := decodeMockDataBody(config)
+	diags = append(diags, dataDiags...)
+	provider.Data = data
+
+	if attr, exists := content.Attributes["source"]; exists {
+
+		// If the source attribute exists, then we don't want to let users
+		// define inline resources and data sources.
+
+		if len(provider.Data.DataSources) > 0 || len(provider.Data.Resources) > 0 {
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid source attribute",
+				Detail:   "You cannot define resource and data blocks inline while also specifying an alternate data source location.",
+				Subject:  attr.NameRange.Ptr(),
+			})
+		} else {
+			var source string
+			sourceDiags := gohcl.DecodeExpression(attr.Expr, nil, &source)
+			diags = append(diags, sourceDiags...)
+
+			if !sourceDiags.HasErrors() {
+				sourceFile, sourceFileDiags := p.LoadHCLFile(path.Join(dir, source))
+				diags = append(diags, sourceFileDiags...)
+				if !sourceFileDiags.HasErrors() {
+					data, dataDiags := decodeMockDataBody(sourceFile)
+					diags = append(diags, dataDiags...)
+					provider.Data = data
+				}
+			}
 		}
 	}
 
@@ -230,6 +319,17 @@ func ParseProviderConfigCompactStr(str string) (addrs.LocalProviderConfig, tfdia
 	addr, addrDiags := ParseProviderConfigCompact(traversal)
 	diags = diags.Append(addrDiags)
 	return addr, diags
+}
+
+var mockBlockSchema = &hcl.BodySchema{
+	Attributes: []hcl.AttributeSchema{
+		{
+			Name: "alias",
+		},
+		{
+			Name: "source",
+		},
+	},
 }
 
 var providerBlockSchema = &hcl.BodySchema{

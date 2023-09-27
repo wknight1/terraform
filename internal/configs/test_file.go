@@ -59,6 +59,10 @@ type TestFile struct {
 	// order.
 	Runs []*TestRun
 
+	// Overrides contains the set of overrides that will be applied for this
+	// test file.
+	Overrides addrs.Map[addrs.Targetable, *ResourceOverride]
+
 	VariablesDeclRange hcl.Range
 }
 
@@ -121,6 +125,10 @@ type TestRun struct {
 	// to report a failure from their custom conditions as part of this test
 	// run.
 	ExpectFailures []hcl.Traversal
+
+	// Overrides contains any specific resource overrides that should be applied
+	// for this run block.
+	Overrides addrs.Map[addrs.Targetable, *ResourceOverride]
 
 	NameDeclRange      hcl.Range
 	VariablesDeclRange hcl.Range
@@ -190,7 +198,7 @@ type TestRunOptions struct {
 	DeclRange hcl.Range
 }
 
-func loadTestFile(body hcl.Body) (*TestFile, hcl.Diagnostics) {
+func loadTestFile(p *Parser, dir string, body hcl.Body) (*TestFile, hcl.Diagnostics) {
 	var diags hcl.Diagnostics
 
 	content, contentDiags := body.Content(testFileSchema)
@@ -198,6 +206,7 @@ func loadTestFile(body hcl.Body) (*TestFile, hcl.Diagnostics) {
 
 	tf := TestFile{
 		Providers: make(map[string]*Provider),
+		Overrides: addrs.MakeMap[addrs.Targetable, *ResourceOverride](),
 	}
 
 	runBlockNames := make(map[string]hcl.Range)
@@ -245,7 +254,48 @@ func loadTestFile(body hcl.Body) (*TestFile, hcl.Diagnostics) {
 			provider, providerDiags := decodeProviderBlock(block)
 			diags = append(diags, providerDiags...)
 			if provider != nil {
-				tf.Providers[provider.moduleUniqueKey()] = provider
+				key := provider.moduleUniqueKey()
+				if previous, exists := tf.Providers[key]; exists {
+					diags = append(diags, &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Duplicate provider block",
+						Detail:   fmt.Sprintf("The provider %s is already defined at %s.", key, previous.NameRange),
+						Subject:  provider.DeclRange.Ptr(),
+					})
+				} else {
+					tf.Providers[key] = provider
+				}
+			}
+		case "mock":
+			provider, providerDiags := decodeMockProviderBlock(p, dir, block)
+			diags = append(diags, providerDiags...)
+			if provider != nil {
+				key := provider.moduleUniqueKey()
+				if previous, exists := tf.Providers[key]; exists {
+					diags = append(diags, &hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Duplicate provider block",
+						Detail:   fmt.Sprintf("The provider %s is already defined at %s.", key, previous.NameRange),
+						Subject:  provider.DeclRange.Ptr(),
+					})
+				} else {
+					tf.Providers[key] = provider
+				}
+			}
+		case "override":
+			override, overrideDiags := decodeOverrideBlock(block, true)
+			diags = append(diags, overrideDiags...)
+			if !overrideDiags.HasErrors() {
+				if existing, ok := tf.Overrides.GetOk(override.Address.Subject); ok {
+					diags = diags.Append(&hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Duplicate override block",
+						Detail:   fmt.Sprintf("An override block targeting %s has already been defined at %s.", existing.Address.Subject, existing.TypeRange),
+						Subject:  override.TypeRange.Ptr(),
+					})
+					continue
+				}
+				tf.Overrides.Put(override.Address.Subject, override)
 			}
 		}
 	}
@@ -321,6 +371,21 @@ func decodeTestRunBlock(block *hcl.Block) (*TestRun, hcl.Diagnostics) {
 			diags = append(diags, moduleDiags...)
 			if !moduleDiags.HasErrors() {
 				r.Module = module
+			}
+		case "override":
+			override, overrideDiags := decodeOverrideBlock(block, true)
+			diags = append(diags, overrideDiags...)
+			if !overrideDiags.HasErrors() {
+				if existing, ok := r.Overrides.GetOk(override.Address.Subject); ok {
+					diags = diags.Append(&hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Duplicate override block",
+						Detail:   fmt.Sprintf("An override block targeting %s has already been defined at %s.", existing.Address.Subject, existing.TypeRange),
+						Subject:  override.TypeRange.Ptr(),
+					})
+					continue
+				}
+				r.Overrides.Put(override.Address.Subject, override)
 			}
 		}
 	}
@@ -549,6 +614,13 @@ var testFileSchema = &hcl.BodySchema{
 			LabelNames: []string{"name"},
 		},
 		{
+			Type:       "mock",
+			LabelNames: []string{"name"},
+		},
+		{
+			Type: "override",
+		},
+		{
 			Type: "variables",
 		},
 	},
@@ -572,6 +644,9 @@ var testRunBlockSchema = &hcl.BodySchema{
 		},
 		{
 			Type: "module",
+		},
+		{
+			Type: "override",
 		},
 	},
 }

@@ -120,6 +120,7 @@ func TestParserLoadConfigDirWithTests(t *testing.T) {
 		"testdata/valid-modules/with-tests-nested",
 		"testdata/valid-modules/with-tests-very-nested",
 		"testdata/valid-modules/with-tests-json",
+		"testdata/valid-modules/with-mocks",
 	}
 
 	for _, directory := range directories {

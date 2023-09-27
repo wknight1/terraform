@@ -37,13 +37,13 @@ func (p *Parser) LoadConfigFileOverride(path string) (*File, hcl.Diagnostics) {
 //
 // It references the same LoadHCLFile as LoadConfigFile, so inherits the same
 // syntax selection behaviours.
-func (p *Parser) LoadTestFile(path string) (*TestFile, hcl.Diagnostics) {
+func (p *Parser) LoadTestFile(path string, basePath string) (*TestFile, hcl.Diagnostics) {
 	body, diags := p.LoadHCLFile(path)
 	if body == nil {
 		return nil, diags
 	}
 
-	test, testDiags := loadTestFile(body)
+	test, testDiags := loadTestFile(p, basePath, body)
 	diags = append(diags, testDiags...)
 	return test, diags
 }
