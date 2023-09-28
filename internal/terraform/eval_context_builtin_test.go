@@ -8,9 +8,10 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/zclconf/go-cty/cty"
+
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/providers"
-	"github.com/zclconf/go-cty/cty"
 )
 
 func TestBuiltinEvalContextProviderInput(t *testing.T) {
@@ -76,11 +77,11 @@ func TestBuildingEvalContextInitProvider(t *testing.T) {
 		Alias:    "foo",
 	}
 
-	_, err := ctx.InitProvider(providerAddrDefault)
+	_, err := ctx.InitProvider(providerAddrDefault, nil)
 	if err != nil {
 		t.Fatalf("error initializing provider test: %s", err)
 	}
-	_, err = ctx.InitProvider(providerAddrAlias)
+	_, err = ctx.InitProvider(providerAddrAlias, nil)
 	if err != nil {
 		t.Fatalf("error initializing provider test.foo: %s", err)
 	}

@@ -408,6 +408,31 @@ func (v *valueFiller) Fill(original, target cty.Value, path cty.Path) (cty.Value
 	}
 }
 
+// DataFiller should be used by data sources to populate their computed values.
+//
+// As data sources skip the middle apply stage, we use the unknownFiller to
+// work out if a resource should be populated and then use the valueFiller to
+// actually populate it.
+func DataFiller() Filler {
+	return &dataFiller{
+		unknown: new(unknownFiller),
+		value:   new(valueFiller),
+	}
+}
+
+type dataFiller struct {
+	unknown *unknownFiller
+	value   *valueFiller
+}
+
+func (d dataFiller) Process(original cty.Value) bool {
+	return d.unknown.Process(original)
+}
+
+func (d dataFiller) Fill(original, target cty.Value, path cty.Path) (cty.Value, tfdiags.Diagnostics) {
+	return d.value.Fill(original, target, path)
+}
+
 func str(n int) string {
 	b := make([]rune, n)
 	for i := range b {

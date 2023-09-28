@@ -403,6 +403,7 @@ func (n *NodeAbstractResourceInstance) planDestroy(ctx EvalContext, currentState
 	// private data.
 	resp := provider.PlanResourceChange(providers.PlanResourceChangeRequest{
 		TypeName:         n.Addr.Resource.Resource.Type,
+		Addr:             n.Addr,
 		Config:           nullVal,
 		PriorState:       unmarkedPriorVal,
 		ProposedNewState: nullVal,
@@ -800,6 +801,7 @@ func (n *NodeAbstractResourceInstance) plan(
 
 	resp := provider.PlanResourceChange(providers.PlanResourceChangeRequest{
 		TypeName:         n.Addr.Resource.Resource.Type,
+		Addr:             n.Addr,
 		Config:           unmarkedConfigVal,
 		PriorState:       unmarkedPriorVal,
 		ProposedNewState: proposedNewVal,
@@ -1034,6 +1036,7 @@ func (n *NodeAbstractResourceInstance) plan(
 
 		resp = provider.PlanResourceChange(providers.PlanResourceChangeRequest{
 			TypeName:         n.Addr.Resource.Resource.Type,
+			Addr:             n.Addr,
 			Config:           unmarkedConfigVal,
 			PriorState:       nullPriorVal,
 			ProposedNewState: proposedNewVal,
@@ -1449,6 +1452,7 @@ func (n *NodeAbstractResourceInstance) readDataSource(ctx EvalContext, configVal
 
 	resp := provider.ReadDataSource(providers.ReadDataSourceRequest{
 		TypeName:     n.Addr.ContainingResource().Resource.Type,
+		Addr:         n.Addr,
 		Config:       configVal,
 		ProviderMeta: metaConfigVal,
 	})
@@ -2295,6 +2299,7 @@ func (n *NodeAbstractResourceInstance) apply(
 
 	resp := provider.ApplyResourceChange(providers.ApplyResourceChangeRequest{
 		TypeName:       n.Addr.Resource.Resource.Type,
+		Addr:           n.Addr,
 		PriorState:     unmarkedBefore,
 		Config:         unmarkedConfigVal,
 		PlannedState:   unmarkedAfter,

@@ -6,6 +6,7 @@ package providers
 import (
 	"github.com/zclconf/go-cty/cty"
 
+	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -240,6 +241,15 @@ type PlanResourceChangeRequest struct {
 	// TypeName is the name of the resource type to plan.
 	TypeName string
 
+	// Addr is the address of the resource from the configuration.
+	//
+	// Within PlanResourceChangeRequest, Addr is a unique field in that it is
+	// only used by the mock provider to work out specific overrides for a given
+	// resource. It is not passed on to the actual providers via the plugin
+	// framework, and so is only available from with the Terraform context for
+	// mocked providers.
+	Addr addrs.Targetable
+
 	// PriorState is the previously saved state value for this resource.
 	PriorState cty.Value
 
@@ -294,6 +304,15 @@ type PlanResourceChangeResponse struct {
 type ApplyResourceChangeRequest struct {
 	// TypeName is the name of the resource type being applied.
 	TypeName string
+
+	// Addr is the address of the resource from the configuration.
+	//
+	// Within ApplyResourceChangeRequest, Addr is a unique field in that it is
+	// only used by the mock provider to work out specific overrides for a given
+	// resource. It is not passed on to the actual providers via the plugin
+	// framework, and so is only available from with the Terraform context for
+	// mocked providers.
+	Addr addrs.Targetable
 
 	// PriorState is the current state of resource.
 	PriorState cty.Value
@@ -399,6 +418,15 @@ func (ir ImportedResource) AsInstanceObject() *states.ResourceInstanceObject {
 type ReadDataSourceRequest struct {
 	// TypeName is the name of the data source type to Read.
 	TypeName string
+
+	// Addr is the address of the resource from the configuration.
+	//
+	// Within ReadDataSourceRequest, Addr is a unique field in that it is only
+	// used by the mock provider to work out specific overrides for a given
+	// data source. It is not passed on to the actual providers via the plugin
+	// framework, and so is only available from with the Terraform context for
+	// mocked providers.
+	Addr addrs.Targetable
 
 	// Config is the complete configuration for the requested data source.
 	Config cty.Value
