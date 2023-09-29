@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/plans/objchange"
 	"github.com/hashicorp/terraform/internal/providers"
+	"github.com/hashicorp/terraform/internal/providers/mocks"
 	"github.com/hashicorp/terraform/internal/provisioners"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -43,6 +44,11 @@ type NodeAbstractResourceInstance struct {
 	// During import we may generate configuration for a resource, which needs
 	// to be stored in the final change.
 	generatedConfigHCL string
+
+	// override is the value this node should return instead of interacting with
+	// the provider. It should only be set by the testing framework and not
+	// during normal executions of Terraform.
+	override *configs.ResourceOverride
 }
 
 // NewNodeAbstractResourceInstance creates an abstract resource instance graph
@@ -133,6 +139,12 @@ func (n *NodeAbstractResourceInstance) AttachResourceState(s *states.Resource) {
 	log.Printf("[TRACE] NodeAbstractResourceInstance.AttachResourceState for %s", n.Addr)
 	n.instanceState = s.Instance(n.Addr.Resource.Key)
 	n.storedProviderConfig = s.ProviderConfig
+}
+
+// GraphNodeAttachOverride
+func (n *NodeAbstractResourceInstance) AttachOverride(override *configs.ResourceOverride) {
+	log.Printf("[TRACE] NodeAbstractResourceInstance.AttachOverride for %s", n.Addr)
+	n.override = override
 }
 
 // readDiff returns the planned change for a particular resource instance
@@ -399,26 +411,35 @@ func (n *NodeAbstractResourceInstance) planDestroy(ctx EvalContext, currentState
 		return plan, diags
 	}
 
-	// Allow the provider to check the destroy plan, and insert any necessary
-	// private data.
-	resp := provider.PlanResourceChange(providers.PlanResourceChangeRequest{
-		TypeName:         n.Addr.Resource.Resource.Type,
-		Addr:             n.Addr,
-		Config:           nullVal,
-		PriorState:       unmarkedPriorVal,
-		ProposedNewState: nullVal,
-		PriorPrivate:     currentState.Private,
-		ProviderMeta:     metaConfigVal,
-	})
+	var resp providers.PlanResourceChangeResponse
+	if n.override != nil {
+		// If we have overridden this resource previously, then destroying it
+		// is just a matter of deleting it from the state.
+		resp = providers.PlanResourceChangeResponse{
+			PlannedState: nullVal,
+		}
+	} else {
+		// Allow the provider to check the destroy plan, and insert any necessary
+		// private data.
+		resp = provider.PlanResourceChange(providers.PlanResourceChangeRequest{
+			TypeName:         n.Addr.Resource.Resource.Type,
+			Addr:             n.Addr,
+			Config:           nullVal,
+			PriorState:       unmarkedPriorVal,
+			ProposedNewState: nullVal,
+			PriorPrivate:     currentState.Private,
+			ProviderMeta:     metaConfigVal,
+		})
 
-	// We may not have a config for all destroys, but we want to reference it in
-	// the diagnostics if we do.
-	if n.Config != nil {
-		resp.Diagnostics = resp.Diagnostics.InConfigBody(n.Config.Config, n.Addr.String())
-	}
-	diags = diags.Append(resp.Diagnostics)
-	if diags.HasErrors() {
-		return plan, diags
+		// We may not have a config for all destroys, but we want to reference it in
+		// the diagnostics if we do.
+		if n.Config != nil {
+			resp.Diagnostics = resp.Diagnostics.InConfigBody(n.Config.Config, n.Addr.String())
+		}
+		diags = diags.Append(resp.Diagnostics)
+		if diags.HasErrors() {
+			return plan, diags
+		}
 	}
 
 	// Check that the provider returned a null value here, since that is the
@@ -799,15 +820,35 @@ func (n *NodeAbstractResourceInstance) plan(
 		return nil, nil, keyData, diags
 	}
 
-	resp := provider.PlanResourceChange(providers.PlanResourceChangeRequest{
-		TypeName:         n.Addr.Resource.Resource.Type,
-		Addr:             n.Addr,
-		Config:           unmarkedConfigVal,
-		PriorState:       unmarkedPriorVal,
-		ProposedNewState: proposedNewVal,
-		PriorPrivate:     priorPrivate,
-		ProviderMeta:     metaConfigVal,
-	})
+	var resp providers.PlanResourceChangeResponse
+	if n.override != nil {
+		// We only override values during a create action, since updates and
+		// deletions will typically already have the computed values set.
+		if priorVal.IsNull() {
+			override, overrideDiags := mocks.FillComputedValues(proposedNewVal, cty.NilVal, schema, mocks.UnknownFiller())
+			resp = providers.PlanResourceChangeResponse{
+				PlannedState: override,
+				Diagnostics:  overrideDiags,
+			}
+		} else {
+			// Otherwise, the override resource always just returns the planned
+			// state exactly.
+			resp = providers.PlanResourceChangeResponse{
+				PlannedState: proposedNewVal,
+			}
+		}
+	} else {
+		resp = provider.PlanResourceChange(providers.PlanResourceChangeRequest{
+			TypeName:         n.Addr.Resource.Resource.Type,
+			Addr:             n.Addr,
+			Config:           unmarkedConfigVal,
+			PriorState:       unmarkedPriorVal,
+			ProposedNewState: proposedNewVal,
+			PriorPrivate:     priorPrivate,
+			ProviderMeta:     metaConfigVal,
+		})
+	}
+
 	diags = diags.Append(resp.Diagnostics.InConfigBody(config.Config, n.Addr.String()))
 	if diags.HasErrors() {
 		return nil, nil, keyData, diags
@@ -1034,15 +1075,26 @@ func (n *NodeAbstractResourceInstance) plan(
 		// create a new proposed value from the null state and the config
 		proposedNewVal = objchange.ProposedNew(schema, nullPriorVal, unmarkedConfigVal)
 
-		resp = provider.PlanResourceChange(providers.PlanResourceChangeRequest{
-			TypeName:         n.Addr.Resource.Resource.Type,
-			Addr:             n.Addr,
-			Config:           unmarkedConfigVal,
-			PriorState:       nullPriorVal,
-			ProposedNewState: proposedNewVal,
-			PriorPrivate:     plannedPrivate,
-			ProviderMeta:     metaConfigVal,
-		})
+		if n.override != nil {
+			// This time we always generate the computed values, since we're
+			// always simulating a create action here.
+			override, overrideDiags := mocks.FillComputedValues(proposedNewVal, cty.NilVal, schema, mocks.UnknownFiller())
+			resp = providers.PlanResourceChangeResponse{
+				PlannedState: override,
+				Diagnostics:  overrideDiags,
+			}
+		} else {
+			resp = provider.PlanResourceChange(providers.PlanResourceChangeRequest{
+				TypeName:         n.Addr.Resource.Resource.Type,
+				Addr:             n.Addr,
+				Config:           unmarkedConfigVal,
+				PriorState:       nullPriorVal,
+				ProposedNewState: proposedNewVal,
+				PriorPrivate:     plannedPrivate,
+				ProviderMeta:     metaConfigVal,
+			})
+		}
+
 		// We need to tread carefully here, since if there are any warnings
 		// in here they probably also came out of our previous call to
 		// PlanResourceChange above, and so we don't want to repeat them.
@@ -1052,6 +1104,7 @@ func (n *NodeAbstractResourceInstance) plan(
 			diags = diags.Append(resp.Diagnostics.InConfigBody(config.Config, n.Addr.String()))
 			return nil, nil, keyData, diags
 		}
+
 		plannedNewVal = resp.PlannedState
 		plannedPrivate = resp.PlannedPrivate
 
@@ -1450,16 +1503,26 @@ func (n *NodeAbstractResourceInstance) readDataSource(ctx EvalContext, configVal
 		return newVal, diags
 	}
 
-	resp := provider.ReadDataSource(providers.ReadDataSourceRequest{
-		TypeName:     n.Addr.ContainingResource().Resource.Type,
-		Addr:         n.Addr,
-		Config:       configVal,
-		ProviderMeta: metaConfigVal,
-	})
+	var resp providers.ReadDataSourceResponse
+	if n.override != nil {
+		override, overrideDiags := mocks.FillComputedValues(configVal, n.override.Values, schema, mocks.DataFiller())
+		resp = providers.ReadDataSourceResponse{
+			State:       override,
+			Diagnostics: overrideDiags,
+		}
+	} else {
+		resp = provider.ReadDataSource(providers.ReadDataSourceRequest{
+			TypeName:     n.Addr.ContainingResource().Resource.Type,
+			Addr:         n.Addr,
+			Config:       configVal,
+			ProviderMeta: metaConfigVal,
+		})
+	}
 	diags = diags.Append(resp.Diagnostics.InConfigBody(config.Config, n.Addr.String()))
 	if diags.HasErrors() {
 		return newVal, diags
 	}
+
 	newVal = resp.State
 	if newVal == cty.NilVal {
 		// This can happen with incompletely-configured mocks. We'll allow it
@@ -2297,15 +2360,34 @@ func (n *NodeAbstractResourceInstance) apply(
 		return newState, diags
 	}
 
-	resp := provider.ApplyResourceChange(providers.ApplyResourceChangeRequest{
-		TypeName:       n.Addr.Resource.Resource.Type,
-		Addr:           n.Addr,
-		PriorState:     unmarkedBefore,
-		Config:         unmarkedConfigVal,
-		PlannedState:   unmarkedAfter,
-		PlannedPrivate: change.Private,
-		ProviderMeta:   metaConfigVal,
-	})
+	var resp providers.ApplyResourceChangeResponse
+	if n.override != nil {
+		if change.Action == plans.Create {
+			override, overrideDiags := mocks.FillComputedValues(unmarkedAfter, n.override.Values, schema, mocks.ValueFiller())
+			// Make up a fake response for our overridden value.
+			resp = providers.ApplyResourceChangeResponse{
+				NewState:    override,
+				Diagnostics: overrideDiags,
+			}
+		} else {
+			// We'll just apply whatever changes to state that the user asked
+			// for. This could be a delete or any update, but either way we
+			// don't have to create any new values.
+			resp = providers.ApplyResourceChangeResponse{
+				NewState: unmarkedAfter,
+			}
+		}
+	} else {
+		resp = provider.ApplyResourceChange(providers.ApplyResourceChangeRequest{
+			TypeName:       n.Addr.Resource.Resource.Type,
+			Addr:           n.Addr,
+			PriorState:     unmarkedBefore,
+			Config:         unmarkedConfigVal,
+			PlannedState:   unmarkedAfter,
+			PlannedPrivate: change.Private,
+			ProviderMeta:   metaConfigVal,
+		})
+	}
 	applyDiags := resp.Diagnostics
 	if applyConfig != nil {
 		applyDiags = applyDiags.InConfigBody(applyConfig.Config, n.Addr.String())

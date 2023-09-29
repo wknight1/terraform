@@ -33,11 +33,6 @@ func FillComputedValues(original, target cty.Value, schema *configschema.Block, 
 func fillComputedValues(original, target cty.Value, schema *configschema.Block, filler Filler, path cty.Path) (cty.Value, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
-	var fmtdPath string
-	if len(path) > 0 {
-		fmtdPath = fmt.Sprintf("%s: ", tfdiags.FormatCtyPath(path))
-	}
-
 	if schema == nil {
 		// The caller must have provided a schema for us to iterate through.
 		panic("must have provided a schema; this is a bug in Terraform - please report it")
@@ -54,7 +49,7 @@ func fillComputedValues(original, target cty.Value, schema *configschema.Block, 
 		// this value. But if we do have defaults, it must be an object type
 		// and this value is provided by the user so we'll surface a real error
 		// for this instead of panicking.
-		diags = diags.Append(tfdiags.Sourceless(tfdiags.Error, "Type mismatch", fmt.Sprintf("%sExpected object but found %s", fmtdPath, target.Type().FriendlyName())))
+		diags = diags.Append(tfdiags.AttributeValue(tfdiags.Error, "Type mismatch", fmt.Sprintf("Expected object but found %s", target.Type().FriendlyName()), path))
 		return original, diags
 	}
 
@@ -87,7 +82,7 @@ func fillComputedValues(original, target cty.Value, schema *configschema.Block, 
 			// sets. We have no way of matching up the users intended nested
 			// block for each value they give us. I think it's therefore simpler
 			// for us to just say all nested blocks are the same.
-			diags = diags.Append(tfdiags.Sourceless(tfdiags.Error, "Type mismatch", fmt.Sprintf("%sExpected attribute %s to be an object but found %s", fmtdPath, name, target.Type().FriendlyName())))
+			diags = diags.Append(tfdiags.AttributeValue(tfdiags.Error, "Type mismatch", fmt.Sprintf("Expected attribute %s to be an object but found %s", name, target.Type().FriendlyName()), path))
 			return original, diags
 		}
 
@@ -191,11 +186,6 @@ func fillComputedValuesForAttribute(original, target cty.Value, schema *configsc
 		return filler.Fill(original, target, path)
 	}
 
-	var fmtdPath string
-	if len(path) > 0 {
-		fmtdPath = fmt.Sprintf("%s: ", tfdiags.FormatCtyPath(path))
-	}
-
 	// If we get here, then we didn't need to do anything for this value at the
 	// current level. However, nested attributes might contain nested computed
 	// values which we need to look for.
@@ -217,7 +207,7 @@ func fillComputedValuesForAttribute(original, target cty.Value, schema *configsc
 			// sets. We have no way of matching up the users intended nested
 			// block for each value they give us. I think it's therefore simpler
 			// for us to just say all nested blocks are the same.
-			diags = diags.Append(tfdiags.Sourceless(tfdiags.Error, "Type mismatch", fmt.Sprintf("%sExpected object but found %s", fmtdPath, target.Type().FriendlyName())))
+			diags = diags.Append(tfdiags.AttributeValue(tfdiags.Error, "Type mismatch", fmt.Sprintf("Expected object but found %s", target.Type().FriendlyName()), path))
 			return original, diags
 		}
 
@@ -354,15 +344,10 @@ func (v *valueFiller) Process(original cty.Value) bool {
 func (v *valueFiller) Fill(original, target cty.Value, path cty.Path) (cty.Value, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
-	var fmtdPath string
-	if len(path) > 0 {
-		fmtdPath = fmt.Sprintf("%s: ", tfdiags.FormatCtyPath(path))
-	}
-
 	if target != cty.NilVal {
 		value, err := convert.Convert(target, original.Type())
 		if err != nil {
-			diags = diags.Append(tfdiags.Sourceless(tfdiags.Error, "Type mismatch", fmt.Sprintf("%sFailed to convert the provided value into the required value: %v", fmtdPath, err)))
+			diags = diags.Append(tfdiags.AttributeValue(tfdiags.Error, "Type mismatch", fmt.Sprintf("Failed to convert the provided value into the required value: %v", err), path))
 			return original, diags
 		}
 		return value, diags

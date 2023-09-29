@@ -8,6 +8,9 @@ import (
 	"log"
 	"strings"
 
+	"github.com/zclconf/go-cty/cty"
+
+	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/logging"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 
@@ -73,6 +76,12 @@ func (g *Graph) walk(walker GraphWalker) tfdiags.Diagnostics {
 			defer walker.ExitPath(pn.Path())
 		}
 
+		// Before we execute or expand a node, we look into our overrides and
+		// check if the vertex needs an overriden value or should be skipped.
+		if g.applyOverrides(vertexCtx.ResourceOverrides(), v) {
+			return
+		}
+
 		// If the node is exec-able, then execute it.
 		if ev, ok := v.(GraphNodeExecutable); ok {
 			diags = diags.Append(walker.Execute(vertexCtx, ev))
@@ -135,4 +144,67 @@ func (g *Graph) walk(walker GraphWalker) tfdiags.Diagnostics {
 	}
 
 	return g.AcyclicGraph.Walk(walkFn)
+}
+
+func (g *Graph) applyOverrides(overrides addrs.Map[addrs.Targetable, *configs.ResourceOverride], target dag.Vertex) bool {
+	if overrides.Len() == 0 {
+		return false
+	}
+
+	switch v := target.(type) {
+	case GraphNodeAttachOverride:
+		addr := v.ResourceInstanceAddr()
+
+		if override, ok := overrides.GetOk(addr); ok {
+			// We want to override the value of this vertex, and still execute
+			// the vertex.
+			v.AttachOverride(override)
+			return false
+		}
+
+		for _, elem := range overrides.Elems {
+			if elem.Key.TargetContains(addr) {
+				// This vertex is inside a module that has been overridden so
+				// we won't execute it.
+				return true
+			}
+		}
+
+	case GraphNodeSetOverrideValue:
+		addr := v.Path()
+
+		if override, ok := overrides.GetOk(addr); ok {
+			// Then this is an output for this overridden module.
+			name := v.GetOverrideKey()
+			if override.Values.Type().HasAttribute(name) {
+				v.SetOverride(override.Values.GetAttr(name))
+			} else {
+				// If the overridden value doesn't contain this output,
+				// then we'll set a dynamic null value.
+				v.SetOverride(cty.NullVal(cty.DynamicPseudoType))
+			}
+			return false
+		}
+
+		for _, elem := range overrides.Elems {
+			if elem.Key.TargetContains(addr) {
+				// This vertex is inside a module that has been overridden so
+				// we won't execute it.
+				return true
+			}
+		}
+
+	case GraphNodeModuleInstance:
+		addr := v.Path()
+
+		for _, elem := range overrides.Elems {
+			if elem.Key.TargetContains(addr) {
+				// This vertex is inside a module that has been overridden so
+				// we won't execute it.
+				return true
+			}
+		}
+	}
+
+	return false
 }

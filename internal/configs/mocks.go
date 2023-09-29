@@ -39,6 +39,8 @@ type ResourceOverride struct {
 
 	Address *addrs.Target
 	Values  cty.Value
+
+	DeclRange hcl.Range
 }
 
 func decodeMockDataBody(body hcl.Body) (*MockData, hcl.Diagnostics) {

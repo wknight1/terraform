@@ -43,6 +43,7 @@ type ContextGraphWalker struct {
 	RootVariableValues InputValues
 	Config             *configs.Config
 	PlanTimestamp      time.Time
+	Overrides          addrs.Map[addrs.Targetable, *configs.ResourceOverride]
 
 	// This is an output. Do not set this, nor read it while a graph walk
 	// is in progress.
@@ -114,6 +115,7 @@ func (w *ContextGraphWalker) EvalContext() EvalContext {
 		Evaluator:             evaluator,
 		VariableValues:        w.variableValues,
 		VariableValuesLock:    &w.variableValuesLock,
+		Overrides:             w.Overrides,
 	}
 
 	return ctx

@@ -205,6 +205,10 @@ type NodeApplyableOutput struct {
 	DestroyApply bool
 
 	Planning bool
+
+	// Override is the value this output node will return for overridden
+	// modules.
+	Override cty.Value
 }
 
 var (
@@ -213,6 +217,7 @@ var (
 	_ GraphNodeReferencer       = (*NodeApplyableOutput)(nil)
 	_ GraphNodeReferenceOutside = (*NodeApplyableOutput)(nil)
 	_ GraphNodeExecutable       = (*NodeApplyableOutput)(nil)
+	_ GraphNodeSetOverrideValue = (*NodeApplyableOutput)(nil)
 	_ graphNodeTemporaryValue   = (*NodeApplyableOutput)(nil)
 	_ dag.GraphNodeDotter       = (*NodeApplyableOutput)(nil)
 )
@@ -234,6 +239,16 @@ func (n *NodeApplyableOutput) Path() addrs.ModuleInstance {
 // GraphNodeModulePath
 func (n *NodeApplyableOutput) ModulePath() addrs.Module {
 	return n.Addr.Module.Module()
+}
+
+// GraphNodeSetOverrideValue
+func (n *NodeApplyableOutput) GetOverrideKey() string {
+	return n.Addr.OutputValue.Name
+}
+
+// GraphNodeSetOverrideValue
+func (n *NodeApplyableOutput) SetOverride(value cty.Value) {
+	n.Override = value
 }
 
 func referenceOutsideForOutput(addr addrs.AbsOutputValue) (selfPath, referencePath addrs.Module) {
@@ -296,6 +311,11 @@ func referencesForOutput(c *configs.Output) []*addrs.Reference {
 
 // GraphNodeReferencer
 func (n *NodeApplyableOutput) References() []*addrs.Reference {
+
+	if n.Override != cty.NilVal {
+		return nil
+	}
+
 	return referencesForOutput(n.Config)
 }
 
@@ -322,7 +342,9 @@ func (n *NodeApplyableOutput) Execute(ctx EvalContext, op walkOperation) (diags 
 
 	// Checks are not evaluated during a destroy. The checks may fail, may not
 	// be valid, or may not have been registered at all.
-	if !n.DestroyApply {
+	// We also don't evaluate checks for overridden values, as any references
+	// within the check will likely not have been created.
+	if !n.DestroyApply && n.Override == cty.NilVal {
 		checkRuleSeverity := tfdiags.Error
 		if n.RefreshOnly {
 			checkRuleSeverity = tfdiags.Warning
@@ -342,32 +364,36 @@ func (n *NodeApplyableOutput) Execute(ctx EvalContext, op walkOperation) (diags 
 	// If there was no change recorded, or the recorded change was not wholly
 	// known, then we need to re-evaluate the output
 	if !changeRecorded || !val.IsWhollyKnown() {
-		// This has to run before we have a state lock, since evaluation also
-		// reads the state
-		var evalDiags tfdiags.Diagnostics
-		val, evalDiags = ctx.EvaluateExpr(n.Config.Expr, cty.DynamicPseudoType, nil)
-		diags = diags.Append(evalDiags)
 
-		// We'll handle errors below, after we have loaded the module.
-		// Outputs don't have a separate mode for validation, so validate
-		// depends_on expressions here too
-		diags = diags.Append(validateDependsOn(ctx, n.Config.DependsOn))
+		val = n.Override
+		if val == cty.NilVal {
+			// This has to run before we have a state lock, since evaluation also
+			// reads the state
+			var evalDiags tfdiags.Diagnostics
+			val, evalDiags = ctx.EvaluateExpr(n.Config.Expr, cty.DynamicPseudoType, nil)
+			diags = diags.Append(evalDiags)
 
-		// For root module outputs in particular, an output value must be
-		// statically declared as sensitive in order to dynamically return
-		// a sensitive result, to help avoid accidental exposure in the state
-		// of a sensitive value that the user doesn't want to include there.
-		if n.Addr.Module.IsRoot() {
-			if !n.Config.Sensitive && marks.Contains(val, marks.Sensitive) {
-				diags = diags.Append(&hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Output refers to sensitive values",
-					Detail: `To reduce the risk of accidentally exporting sensitive data that was intended to be only internal, Terraform requires that any root module output containing sensitive data be explicitly marked as sensitive, to confirm your intent.
+			// We'll handle errors below, after we have loaded the module.
+			// Outputs don't have a separate mode for validation, so validate
+			// depends_on expressions here too
+			diags = diags.Append(validateDependsOn(ctx, n.Config.DependsOn))
+
+			// For root module outputs in particular, an output value must be
+			// statically declared as sensitive in order to dynamically return
+			// a sensitive result, to help avoid accidental exposure in the state
+			// of a sensitive value that the user doesn't want to include there.
+			if n.Addr.Module.IsRoot() {
+				if !n.Config.Sensitive && marks.Contains(val, marks.Sensitive) {
+					diags = diags.Append(&hcl.Diagnostic{
+						Severity: hcl.DiagError,
+						Summary:  "Output refers to sensitive values",
+						Detail: `To reduce the risk of accidentally exporting sensitive data that was intended to be only internal, Terraform requires that any root module output containing sensitive data be explicitly marked as sensitive, to confirm your intent.
 
 If you do intend to export this data, annotate the output value as sensitive by adding the following argument:
     sensitive = true`,
-					Subject: n.Config.DeclRange.Ptr(),
-				})
+						Subject: n.Config.DeclRange.Ptr(),
+					})
+				}
 			}
 		}
 	}

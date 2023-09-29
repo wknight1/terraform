@@ -206,4 +206,8 @@ type EvalContext interface {
 	// WithPath returns a copy of the context with the internal path set to the
 	// path argument.
 	WithPath(path addrs.ModuleInstance) EvalContext
+
+	// ResourceOverrides contains the set of overrides that should be applied
+	// during the execution of the graph.
+	ResourceOverrides() addrs.Map[addrs.Targetable, *configs.ResourceOverride]
 }

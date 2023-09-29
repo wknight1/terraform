@@ -404,3 +404,7 @@ func (c *MockEvalContext) InstanceExpander() *instances.Expander {
 	c.InstanceExpanderCalled = true
 	return c.InstanceExpanderExpander
 }
+
+func (c *MockEvalContext) ResourceOverrides() addrs.Map[addrs.Targetable, *configs.ResourceOverride] {
+	return addrs.MakeMap[addrs.Targetable, *configs.ResourceOverride]()
+}

@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/checks"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/instances"
@@ -42,6 +43,8 @@ type graphWalkOpts struct {
 	PlanTimeTimestamp time.Time
 
 	MoveResults refactoring.MoveResults
+
+	Overrides addrs.Map[addrs.Targetable, *configs.ResourceOverride]
 }
 
 func (c *Context) walk(graph *Graph, operation walkOperation, opts *graphWalkOpts) (*ContextGraphWalker, tfdiags.Diagnostics) {
@@ -150,5 +153,6 @@ func (c *Context) graphWalker(operation walkOperation, opts *graphWalkOpts) *Con
 		Operation:        operation,
 		StopContext:      c.runContext,
 		PlanTimestamp:    opts.PlanTimeTimestamp,
+		Overrides:        opts.Overrides,
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/lang/globalref"
 	"github.com/hashicorp/terraform/internal/states"
@@ -111,6 +112,13 @@ type Plan struct {
 	// terraform testing framework, and so isn't written into any external
 	// representation of the plan.
 	ExternalReferences []*addrs.Reference
+
+	// Overrides contains the set of overrides that were applied while making
+	// this plan. We need to provide the same set of overrides when applying the
+	// plan so we preserve them here. As with PlannedState and
+	// ExternalReferences this is only used by the terraform testing framework,
+	// and so isn't written into any external representation of the plan.
+	Overrides addrs.Map[addrs.Targetable, *configs.ResourceOverride]
 
 	// Timestamp is the record of truth for when the plan happened.
 	Timestamp time.Time

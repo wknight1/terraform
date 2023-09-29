@@ -70,6 +70,8 @@ func (c *Context) Apply(plan *plans.Plan, config *configs.Config) (*states.State
 
 		// We also want to propagate the timestamp from the plan file.
 		PlanTimeTimestamp: plan.Timestamp,
+
+		Overrides: plan.Overrides,
 	})
 	diags = diags.Append(walker.NonFatalDiagnostics)
 	diags = diags.Append(walkDiags)

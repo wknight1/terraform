@@ -88,6 +88,10 @@ type PlanOpts struct {
 	//
 	// If empty, then no config will be generated.
 	GenerateConfigPath string
+
+	// Overrides provides a set of configs.ResourceOverride objects that should
+	// be applied during this plan.
+	Overrides addrs.Map[addrs.Targetable, *configs.ResourceOverride]
 }
 
 // Plan generates an execution plan by comparing the given configuration
@@ -601,6 +605,7 @@ func (c *Context) planWalk(config *configs.Config, prevRunState *states.State, o
 		Changes:           changes,
 		MoveResults:       moveResults,
 		PlanTimeTimestamp: timestamp,
+		Overrides:         opts.Overrides,
 	})
 	diags = diags.Append(walker.NonFatalDiagnostics)
 	diags = diags.Append(walkDiags)
