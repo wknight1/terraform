@@ -661,6 +661,7 @@ func (c *Context) planWalk(config *configs.Config, prevRunState *states.State, o
 		PriorState:         priorState,
 		PlannedState:       walker.State.Close(),
 		ExternalReferences: opts.ExternalReferences,
+		Overrides:          opts.Overrides,
 		Checks:             states.NewCheckResults(walker.Checks),
 		Timestamp:          timestamp,
 

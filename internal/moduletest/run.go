@@ -108,6 +108,47 @@ func (run *Run) GetReferences() ([]*addrs.Reference, tfdiags.Diagnostics) {
 	return references, diagnostics
 }
 
+// GetOverrides returns a combined map of overrides from the overrides defined
+// within this run block and within the file.
+//
+// Overrides within the run block will take precedence over overrides from the
+// file. It is also possible for a run block to complete remove overrides that
+// are referenced from the file. For example, if a run block overrides a module
+// and the file overrides a specific resource from within that module we only
+// care about the larger override from the file.
+//
+// We have validations elsewhere that ensure we haven't done something
+// impossible like overridden a resource in a module within a run block while
+// the file overall is overriding the entire module.
+func (run *Run) GetOverrides(file *File) addrs.Map[addrs.Targetable, *configs.ResourceOverride] {
+
+	overrides := addrs.MakeMap[addrs.Targetable, *configs.ResourceOverride]()
+	for _, elem := range run.Config.Overrides.Elems {
+		overrides.Put(elem.Key, elem.Value)
+	}
+
+	for _, elem := range file.Config.Overrides.Elems {
+		if overrides.Has(elem.Key) {
+			// Then we've overridden this value exactly.
+			continue
+		}
+
+		for _, already := range overrides.Elems {
+			// Then we are overriding a module within the run block, and this
+			// override from the file is targeting a resource within that
+			// module.
+			if already.Key.TargetContains(elem.Key) {
+				continue
+			}
+		}
+
+		// If nothing else is true, then we include this override as well.
+		overrides.Put(elem.Key, elem.Value)
+	}
+
+	return overrides
+}
+
 // ExplainExpectedFailures is similar to ValidateExpectedFailures except it
 // looks for any diagnostics produced by custom conditions and are included in
 // the expected failures and adds an additional explanation that clarifies the

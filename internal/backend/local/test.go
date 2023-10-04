@@ -546,6 +546,10 @@ func (runner *TestFileRunner) destroy(config *configs.Config, state *states.Stat
 	planOpts := &terraform.PlanOpts{
 		Mode:         plans.DestroyMode,
 		SetVariables: variables,
+
+		// We need to set the overrides when destroying so we don't get errors
+		// about providers trying to destroy resources that they never created.
+		Overrides: run.GetOverrides(file),
 	}
 
 	tfCtx, ctxDiags := terraform.NewContext(runner.Suite.Opts)
@@ -616,6 +620,7 @@ func (runner *TestFileRunner) plan(config *configs.Config, state *states.State, 
 		SkipRefresh:        !run.Config.Options.Refresh,
 		SetVariables:       variables,
 		ExternalReferences: references,
+		Overrides:          run.GetOverrides(file),
 	}
 
 	tfCtx, ctxDiags := terraform.NewContext(runner.Suite.Opts)
