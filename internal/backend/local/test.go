@@ -13,7 +13,6 @@ import (
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/zclconf/go-cty/cty"
-	"github.com/zclconf/go-cty/cty/convert"
 	"golang.org/x/exp/slices"
 
 	"github.com/hashicorp/terraform/internal/addrs"
@@ -75,6 +74,12 @@ func (runner *TestSuiteRunner) Cancel() {
 
 func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
+
+	validateDiags := runner.validate()
+	diags = diags.Append(validateDiags)
+	if validateDiags.HasErrors() {
+		return moduletest.Error, diags
+	}
 
 	suite, suiteDiags := runner.collectTests()
 	diags = diags.Append(suiteDiags)
@@ -194,6 +199,46 @@ func (runner *TestSuiteRunner) collectTests() (*moduletest.Suite, tfdiags.Diagno
 	log.Printf("[DEBUG] TestSuiteRunner: found %d files with %d run blocks", fileCount, runCount)
 
 	return suite, diags
+}
+
+func (runner *TestSuiteRunner) validate() tfdiags.Diagnostics {
+	ctx, diags := terraform.NewContext(runner.Opts)
+	if diags.HasErrors() {
+		return diags
+	}
+
+	runningCtx, done := context.WithCancel(context.Background())
+
+	var validateDiags tfdiags.Diagnostics
+	go func() {
+		defer logging.PanicHandler()
+		defer done()
+
+		log.Println("[DEBUG] TestFileRunner: starting validation for config")
+		validateDiags = ctx.Validate(runner.Config)
+		log.Println("[DEBUG] TestFileRunner: completed validation for config")
+	}()
+
+	select {
+	case <-runner.StoppedCtx.Done():
+		ctx.Stop() // Exit the validation early.
+
+		select {
+		case <-runner.CancelledCtx.Done():
+		// Also do nothing, we'll just exit at this point without reporting
+		// the data.
+		case <-runningCtx.Done():
+			// Do nothing, finished normally.
+		}
+
+	case <-runner.CancelledCtx.Done():
+		// Also do nothing, we'll just exit at this point without reporting
+		// the data.
+	case <-runningCtx.Done():
+		// Do nothing, finished normally.
+	}
+
+	return diags.Append(validateDiags)
 }
 
 type TestFileRunner struct {
@@ -337,7 +382,14 @@ func (runner *TestFileRunner) run(run *moduletest.Run, file *moduletest.File, st
 		return state, false
 	}
 
-	resetConfig, configDiags := config.TransformForTest(run.Config, file.Config)
+	variables, variableDiags := runner.collectInputValues(config, run, file)
+	run.Diagnostics = run.Diagnostics.Append(variableDiags)
+	if variableDiags.HasErrors() {
+		run.Status = moduletest.Error
+		return state, false
+	}
+
+	resetConfig, configDiags := runner.transform(config, run, file, variables)
 	defer resetConfig()
 
 	run.Diagnostics = run.Diagnostics.Append(configDiags)
@@ -360,21 +412,12 @@ func (runner *TestFileRunner) run(run *moduletest.Run, file *moduletest.File, st
 		return state, false
 	}
 
-	planCtx, plan, planDiags := runner.plan(config, state, run, file, references, start)
+	planCtx, plan, planDiags := runner.plan(config, state, run, file, references, variables, start)
 	if run.Config.Command == configs.PlanTestCommand {
 		// Then we want to assess our conditions and diagnostics differently.
 		planDiags = run.ValidateExpectedFailures(planDiags)
 		run.Diagnostics = run.Diagnostics.Append(planDiags)
 		if planDiags.HasErrors() {
-			run.Status = moduletest.Error
-			return state, false
-		}
-
-		variables, resetVariables, variableDiags := runner.prepareInputVariablesForAssertions(config, run, file, references)
-		defer resetVariables()
-
-		run.Diagnostics = run.Diagnostics.Append(variableDiags)
-		if variableDiags.HasErrors() {
 			run.Status = moduletest.Error
 			return state, false
 		}
@@ -456,17 +499,6 @@ func (runner *TestFileRunner) run(run *moduletest.Run, file *moduletest.File, st
 		return updated, true
 	}
 
-	variables, resetVariables, variableDiags := runner.prepareInputVariablesForAssertions(config, run, file, references)
-	if resetVariables != nil {
-		defer resetVariables()
-	}
-
-	run.Diagnostics = run.Diagnostics.Append(variableDiags)
-	if variableDiags.HasErrors() {
-		run.Status = moduletest.Error
-		return updated, true
-	}
-
 	if runner.Suite.Verbose {
 		schemas, diags := planCtx.Schemas(config, plan.PlannedState)
 
@@ -542,7 +574,7 @@ func (runner *TestFileRunner) validate(config *configs.Config, run *moduletest.R
 	return diags
 }
 
-func (runner *TestFileRunner) destroy(config *configs.Config, state *states.State, run *moduletest.Run, file *moduletest.File) (*states.State, tfdiags.Diagnostics) {
+func (runner *TestFileRunner) destroy(config *configs.Config, state *states.State, run *moduletest.Run, file *moduletest.File, variables terraform.InputValues) (*states.State, tfdiags.Diagnostics) {
 	log.Printf("[TRACE] TestFileRunner: called destroy for %s/%s", file.Name, run.Name)
 
 	if state.Empty() {
@@ -551,9 +583,6 @@ func (runner *TestFileRunner) destroy(config *configs.Config, state *states.Stat
 	}
 
 	var diags tfdiags.Diagnostics
-
-	variables, variableDiags := runner.buildInputVariablesForTest(run, file, config)
-	diags = diags.Append(variableDiags)
 
 	if diags.HasErrors() {
 		return state, diags
@@ -603,7 +632,7 @@ func (runner *TestFileRunner) destroy(config *configs.Config, state *states.Stat
 	return updated, diags
 }
 
-func (runner *TestFileRunner) plan(config *configs.Config, state *states.State, run *moduletest.Run, file *moduletest.File, references []*addrs.Reference, start int64) (*terraform.Context, *plans.Plan, tfdiags.Diagnostics) {
+func (runner *TestFileRunner) plan(config *configs.Config, state *states.State, run *moduletest.Run, file *moduletest.File, references []*addrs.Reference, variables terraform.InputValues, start int64) (*terraform.Context, *plans.Plan, tfdiags.Diagnostics) {
 	log.Printf("[TRACE] TestFileRunner: called plan for %s/%s", file.Name, run.Name)
 
 	var diags tfdiags.Diagnostics
@@ -613,13 +642,6 @@ func (runner *TestFileRunner) plan(config *configs.Config, state *states.State, 
 
 	replaces, replaceDiags := run.GetReplaces()
 	diags = diags.Append(replaceDiags)
-
-	variables, variableDiags := runner.buildInputVariablesForTest(run, file, config)
-	diags = diags.Append(variableDiags)
-
-	if diags.HasErrors() {
-		return nil, nil, diags
-	}
 
 	planOpts := &terraform.PlanOpts{
 		Mode: func() plans.Mode {
@@ -837,12 +859,18 @@ func (runner *TestFileRunner) cleanup(file *moduletest.File) {
 			diags = diags.Append(tfdiags.Sourceless(tfdiags.Error, "Inconsistent state", fmt.Sprintf("Found inconsistent state while cleaning up %s. This is a bug in Terraform - please report it", file.Name)))
 		}
 	} else {
-		reset, configDiags := runner.Suite.Config.TransformForTest(main.Run.Config, file.Config)
+		run := main.Run
+		config := runner.Suite.Config
+
+		variables, variableDiags := runner.collectInputValues(config, run, file)
+		diags = diags.Append(variableDiags)
+
+		reset, configDiags := runner.transform(config, run, file, variables)
 		diags = diags.Append(configDiags)
 
 		if !configDiags.HasErrors() {
 			var destroyDiags tfdiags.Diagnostics
-			updated, destroyDiags = runner.destroy(runner.Suite.Config, main.State, main.Run, file)
+			updated, destroyDiags = runner.destroy(config, main.State, run, file, variables)
 			diags = diags.Append(destroyDiags)
 		}
 
@@ -912,13 +940,19 @@ func (runner *TestFileRunner) cleanup(file *moduletest.File) {
 
 		var diags tfdiags.Diagnostics
 
-		reset, configDiags := state.Run.Config.ConfigUnderTest.TransformForTest(state.Run.Config, file.Config)
+		run := state.Run
+		config := run.Config.ConfigUnderTest
+
+		variables, variableDiags := runner.collectInputValues(config, run, file)
+		diags = diags.Append(variableDiags)
+
+		reset, configDiags := runner.transform(config, run, file, variables)
 		diags = diags.Append(configDiags)
 
 		updated := state.State
 		if !diags.HasErrors() {
 			var destroyDiags tfdiags.Diagnostics
-			updated, destroyDiags = runner.destroy(state.Run.Config.ConfigUnderTest, state.State, state.Run, file)
+			updated, destroyDiags = runner.destroy(config, state.State, run, file, variables)
 			diags = diags.Append(destroyDiags)
 		}
 
@@ -933,136 +967,103 @@ func (runner *TestFileRunner) cleanup(file *moduletest.File) {
 	}
 }
 
-// buildInputVariablesForTest creates a terraform.InputValues mapping for
-// variable values that are relevant to the config being tested.
-//
-// Crucially, it differs from prepareInputVariablesForAssertions in that it only
-// includes variables that are reference by the config and not everything that
-// is defined within the test run block and test file.
-func (runner *TestFileRunner) buildInputVariablesForTest(run *moduletest.Run, file *moduletest.File, config *configs.Config) (terraform.InputValues, tfdiags.Diagnostics) {
+// collectInputValues collects all the values for the input variables required
+// for this run block from the various input sources, and returns them ready
+// to be passed into the Terraform graph.
+func (runner *TestFileRunner) collectInputValues(config *configs.Config, run *moduletest.Run, file *moduletest.File) (terraform.InputValues, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
-	// configVariables keeps track of the variables that will actually be given
-	// to the terraform graph to provide values to the configuration.
-	configVariables := make(terraform.InputValues)
+	variables := make(terraform.InputValues)
 
-	// ctxVariables contains all the possible variables we have definitions for
-	// and is used to build the context that is used to evaluate variables.
-	ctxVariables := make(terraform.InputValues)
+	// Firstly, we check all the global variables. These are the variable values
+	// defined in environment variables, via the command-line, or in .tfvars
+	// files.
 
-	// First, we process all the global variables.
 	for name, value := range runner.Suite.GlobalVariables {
 		var variableDiags tfdiags.Diagnostics
 		if variable, exists := config.Module.Variables[name]; exists {
-			ctxVariables[name], variableDiags = value.ParseVariableValue(variable.ParsingMode)
-			configVariables[name] = ctxVariables[name]
+			variables[name], variableDiags = value.ParseVariableValue(variable.ParsingMode)
 		} else {
-			// Since we don't have the config here to parse the variable value
-			// we just blanket parse it as an HCL expression. We don't include
-			// this in the configVariables, as we only want variables that are
-			// defined in the context.
-			ctxVariables[name], variableDiags = value.ParseVariableValue(configs.VariableParseHCL)
+			variables[name], variableDiags = value.ParseVariableValue(configs.VariableParseHCL)
 		}
 		diags = diags.Append(variableDiags)
 	}
 
-	// Second, we process the variables defined at the file level
-	//
-	// We're happy for anything here to override any values from the global
-	// variables.
+	// Secondly, we check all the file level variables. These are the variable
+	// values defined in a `variables` block within the file. Variables defined
+	// at this level overwrite variables defined in the global variables, so
+	// we don't need to do any checking for collisions here.
+
 	if file != nil {
 		for name, expr := range file.Config.Variables {
-
 			value := unparsedTestVariableValue{
 				expr: expr,
 			}
 
 			var variableDiags tfdiags.Diagnostics
 			if variable, exists := config.Module.Variables[name]; exists {
-				ctxVariables[name], variableDiags = value.ParseVariableValue(variable.ParsingMode)
-				configVariables[name] = ctxVariables[name]
+				variables[name], variableDiags = value.ParseVariableValue(variable.ParsingMode)
 			} else {
-				// As above, we don't have this defined in the config so we
-				// parse it as an expression and don't include it in
-				// configVariables.
-				ctxVariables[name], variableDiags = value.ParseVariableValue(configs.VariableParseHCL)
+				variables[name], variableDiags = value.ParseVariableValue(configs.VariableParseHCL)
 			}
 			diags = diags.Append(variableDiags)
 		}
 	}
 
-	// Thirdly, we process the variables defined at the run level and pull out
-	// any that are relevant to the config under test.
-	//
-	// We're happy for anything here to override any values from the global or
-	// file level variables
-	if run != nil {
-		skipVars := false
+	// Thirdly, we check all the run level variables. These are the variable
+	// values defined in a `variables` block within a run block. Variables
+	// defined at this level overwrite variables defined previously so, again,
+	// we're not checking for collisions.
 
-		ctx, ctxDiags := runner.ctx(run, file, ctxVariables)
-		diags = diags.Append(ctxDiags)
-		if ctxDiags.HasErrors() {
-			// We still want to validate all the right variables are being
-			// declared. So we don't return early, but we note that we shouldn't
-			// eval vars from this block.
-			skipVars = true
+	// Run block variables can also reference previously defined variables. So,
+	// we're going to build an HCL context for evaluating these values. If we
+	// fail to build the context, then we don't want to try to apply it but we
+	// still want to track the variables we have values for. Therefore, we keep
+	// track of whether the ctx is valid or not in skipRunVars.
+	skipRunVars := false
+
+	ctx, ctxDiags := runner.ctx(run, file, variables)
+	diags = diags.Append(ctxDiags)
+	if ctxDiags.HasErrors() {
+		skipRunVars = true
+	}
+
+	for name, expr := range run.Config.Variables {
+		if skipRunVars {
+			// Then we don't have a valid context, so we don't want to actually
+			// try to build this variable at all. But, we still want to track
+			// that a value was given for it. There's a different error raised
+			// later for "missing" values. The ctxDiags processed earlier are
+			// providing the error for this.
+			variables[name] = &terraform.InputValue{
+				Value:       cty.NilVal,
+				SourceType:  terraform.ValueFromConfig,
+				SourceRange: tfdiags.SourceRangeFromHCL(expr.Range()),
+			}
+			continue
 		}
 
-		for name, expr := range run.Config.Variables {
-			variable, exists := config.Module.Variables[name]
-			if !exists {
-				// At this point we are going to add a warning if a variable
-				// is defined within a run block and not referenced by the
-				// configuration under test.
-				diags = diags.Append(&hcl.Diagnostic{
-					Severity: hcl.DiagWarning,
-					Summary:  "Value for undeclared variable",
-					Detail:   fmt.Sprintf("The module under test does not declare a variable named %q, but it is declared in run block %q.", name, run.Name),
-					Subject:  expr.Range().Ptr(),
-				})
-
-				continue
-			}
-
-			if skipVars {
-				// Then we don't have a valid evaluation context, so we won't
-				// actually process these variables. We'll put in a dummy value
-				// knowing that we have errors in the diags so these won't be
-				// processed.
-				//
-				// We still want to track this variable has a value, even if we
-				// don't know what it is, because we have some validations later
-				// that we don't want to trigger because this variable is
-				// missing.
-
-				configVariables[name] = &terraform.InputValue{
-					Value:       cty.NilVal,
-					SourceType:  terraform.ValueFromConfig,
-					SourceRange: tfdiags.SourceRangeFromHCL(variable.DeclRange),
-				}
-
-				continue
-			}
-
-			value := unparsedTestVariableValue{
-				expr: expr,
-				ctx:  ctx,
-			}
-
-			var variableDiags tfdiags.Diagnostics
-			configVariables[name], variableDiags = value.ParseVariableValue(variable.ParsingMode)
-			diags = diags.Append(variableDiags)
+		value := unparsedTestVariableValue{
+			expr: expr,
+			ctx:  ctx,
 		}
 
+		var variableDiags tfdiags.Diagnostics
+		if variable, exists := config.Module.Variables[name]; exists {
+			variables[name], variableDiags = value.ParseVariableValue(variable.ParsingMode)
+		} else {
+			variables[name], variableDiags = value.ParseVariableValue(configs.VariableParseHCL)
+		}
+		diags = diags.Append(variableDiags)
 	}
 
 	// Finally, we'll do something about any variables defined in the
 	// configuration that we haven't given values for.
 
-	for name, variable := range config.Module.Variables {
-
-		if _, exists := configVariables[name]; exists {
-			// Then we have a value for this variable already.
+	for name, config := range config.Module.Variables {
+		if _, exists := variables[name]; exists {
+			// Then we have provided a value for this, so let's not overwrite
+			// that with the defaults.
 			continue
 		}
 
@@ -1070,243 +1071,129 @@ func (runner *TestFileRunner) buildInputVariablesForTest(run *moduletest.Run, fi
 		// processed by the Terraform graph and provided a default value later
 		// if they have one.
 
-		if variable.Required() {
+		if config.Required() {
 
 			diags = diags.Append(&hcl.Diagnostic{
 				Severity: hcl.DiagError,
 				Summary:  "No value for required variable",
 				Detail: fmt.Sprintf("The module under test for run block %q has a required variable %q with no set value. Use a -var or -var-file command line argument or add this variable into a \"variables\" block within the test file or run block.",
-					run.Name, variable.Name),
-				Subject: variable.DeclRange.Ptr(),
+					run.Name, config.Name),
+				Subject: config.DeclRange.Ptr(),
 			})
 
-			configVariables[name] = &terraform.InputValue{
+			variables[name] = &terraform.InputValue{
 				Value:       cty.DynamicVal,
 				SourceType:  terraform.ValueFromConfig,
-				SourceRange: tfdiags.SourceRangeFromHCL(variable.DeclRange),
+				SourceRange: tfdiags.SourceRangeFromHCL(config.DeclRange),
 			}
 		} else {
-			configVariables[name] = &terraform.InputValue{
+			variables[name] = &terraform.InputValue{
 				Value:       cty.NilVal,
 				SourceType:  terraform.ValueFromConfig,
-				SourceRange: tfdiags.SourceRangeFromHCL(variable.DeclRange),
+				SourceRange: tfdiags.SourceRangeFromHCL(config.DeclRange),
 			}
 		}
-
 	}
 
-	return configVariables, diags
+	return variables, diags
 }
 
-// prepareInputVariablesForAssertions creates a terraform.InputValues mapping
-// that contains all the variables defined for a given run and file, alongside
-// any unset variables that have defaults within the provided config.
+// TransformConfigForTest prepares the provided config to be executed by the
+// current run block.
 //
-// Crucially, it differs from buildInputVariablesForTest in that the returned
-// input values include all variables available even if they are not defined
-// within the config. This allows the assertions to refer to variables defined
-// solely within the test file, and not only those within the configuration.
+// This function directly edits the config that is to be tested, and returns a
+// function that will reset the config back to its original state.
 //
-// In addition, it modifies the provided config so that any variables that are
-// available are also defined in the config. It returns a function that resets
-// the config which must be called so the config can be reused going forward.
-func (runner *TestFileRunner) prepareInputVariablesForAssertions(config *configs.Config, run *moduletest.Run, file *moduletest.File, references []*addrs.Reference) (terraform.InputValues, func(), tfdiags.Diagnostics) {
+// Tests will call this before they execute, and then call the deferred function
+// to reset the config before the next test.
+func (runner *TestFileRunner) transform(config *configs.Config, run *moduletest.Run, file *moduletest.File, variables terraform.InputValues) (func(), tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
-	// process is a helper function that converts an unparsed variable into an
-	// input value. All the various input formats share this logic so we extract
-	// it out here.
-	process := func(name string, value backend.UnparsedVariableValue, reference *addrs.Reference) (*terraform.InputValue, tfdiags.Diagnostics) {
-		if config, exists := config.Module.Variables[name]; exists {
-			variable, diags := value.ParseVariableValue(config.ParsingMode)
-			if diags.HasErrors() {
-				return variable, diags
-			}
+	// We need to override two parts of the configuration.
+	//   - We need to add additional variable config definitions if any of the
+	//     provided variables have been defined directly within the current test
+	//     file and/or run block.
+	//   - We need to override the provider definitions so that they use any
+	//     providers defined within the test file instead of providers defined
+	//     directly within the configuration.
 
-			given := variable.Value
+	// Let's handle the providers first.
 
-			// Normally, variable values would be converted during the Terraform
-			// graph processing. But, `terraform test` assertions are not
-			// executed during the graph but after. This means the variables we
-			// create for use in the assertions must be converted here.
+	cfgProviders := config.Module.ProviderConfigs
+	testProviders := make(map[string]*configs.Provider)
+	for key, value := range cfgProviders {
+		testProviders[key] = value
+	}
 
-			if config.TypeDefaults != nil && !given.IsNull() {
-				given = config.TypeDefaults.Apply(given)
-			}
+	if len(run.Config.Providers) > 0 {
+		// If we have a specific provider mapping in the run block then we're
+		// going to only copy over the providers requested.
 
-			converted, err := convert.Convert(given, config.ConstraintType)
-			if err != nil {
-				var subject *hcl.Range
-				if reference != nil {
-					subject = reference.SourceRange.ToHCL().Ptr()
-				}
+		for _, ref := range run.Config.Providers {
 
+			testProvider, ok := file.Config.Providers[ref.InParent.String()]
+			if !ok {
+				// Then this reference was invalid as we didn't have the
+				// specified provider in the parent. This should have been
+				// caught earlier in validation anyway so is unlikely to happen.
 				diags = diags.Append(&hcl.Diagnostic{
 					Severity: hcl.DiagError,
-					Summary:  "Invalid value for input variable",
-					Detail:   fmt.Sprintf("The given value is not suitable for var.%s declared at %s: %s.", name, config.DeclRange.String(), err),
-					Subject:  subject,
+					Summary:  fmt.Sprintf("Missing provider definition for %s", ref.InParent.String()),
+					Detail:   "This provider block references a provider definition that does not exist.",
+					Subject:  ref.InParent.NameRange.Ptr(),
 				})
-				return variable, diags
-			}
-
-			variable.Value = converted
-			return variable, diags
-		} else {
-
-			// If the variable isn't defined in the config, then we don't know
-			// what type it is supposed to be. So we'll just parse it as HCL and
-			// we can deduce the type that way.
-
-			return value.ParseVariableValue(configs.VariableParseHCL)
-		}
-	}
-
-	// relevant keeps track of the variables that are actually referenced by
-	// this set of assertions.
-	relevant := make(map[string]*addrs.Reference)
-	for _, reference := range references {
-		addr, ok := reference.Subject.(addrs.InputVariable)
-		if !ok {
-			// We only care about variables.
-			continue
-		}
-
-		relevant[addr.Name] = reference
-	}
-
-	variables := make(terraform.InputValues)
-
-	// Now, we're going to process the various different sources of variables
-	// and turn them into input values that our test context can read.
-
-	// First, we'll process the global variables.
-
-	for name, value := range runner.Suite.GlobalVariables {
-		variable, variableDiags := process(name, value, relevant[name])
-		diags = diags.Append(variableDiags)
-		if variable != nil {
-			variables[name] = variable
-		}
-	}
-
-	// Second, we'll process the variables from the file.
-
-	if file != nil {
-		for name, expr := range file.Config.Variables {
-			value := unparsedTestVariableValue{
-				expr: expr,
-			}
-
-			variable, variableDiags := process(name, value, relevant[name])
-			diags = diags.Append(variableDiags)
-			if variable != nil {
-				variables[name] = variable
-			}
-		}
-	}
-
-	// Third, we'll process the variables from the run block. We pass in the
-	// variables from the global and file level into the eval context here so
-	// that users can set run variables from file and global variables.
-
-	if run != nil {
-		skipVars := false
-
-		ctx, ctxDiags := runner.ctx(run, file, variables)
-		diags = diags.Append(ctxDiags)
-		if ctxDiags.HasErrors() {
-			// Then we won't try and actually evaluate run variables but we do
-			// keep note of them.
-			skipVars = true
-		}
-
-		for name, expr := range run.Config.Variables {
-
-			if skipVars {
-
-				// Then we had a problem with the evaluation context.
-				//
-				// We'll just make a placeholder input value so we can finish
-				// evaluating everything else. We won't end up using the
-				// placeholder values as the test will fail due to the errored
-				// diags when we build the context.
-
-				variables[name] = &terraform.InputValue{
-					Value:       cty.NilVal,
-					SourceType:  terraform.ValueFromConfig,
-					SourceRange: tfdiags.SourceRangeFromHCL(expr.Range()),
-				}
-
 				continue
 			}
 
-			value := unparsedTestVariableValue{
-				expr: expr,
-				ctx:  ctx,
+			testProviders[ref.InChild.String()] = &configs.Provider{
+				Name:       ref.InChild.Name,
+				NameRange:  ref.InChild.NameRange,
+				Alias:      ref.InChild.Alias,
+				AliasRange: ref.InChild.AliasRange,
+				Version:    testProvider.Version,
+				Config:     testProvider.Config,
+				DeclRange:  testProvider.DeclRange,
 			}
 
-			variable, variableDiags := process(name, value, relevant[name])
-			diags = diags.Append(variableDiags)
-			if variable != nil {
-				variables[name] = variable
-			}
+		}
+	} else {
+		// Otherwise, let's copy over and overwrite all providers specified by
+		// the test file itself.
+		for key, provider := range file.Config.Providers {
+			testProviders[key] = provider
 		}
 	}
 
-	// Finally, we look for any default values from the configuration for
-	// variables that we haven't assigned a value to yet.
+	// Now, we'll do the variables.
 
-	for name, variable := range config.Module.Variables {
-		if _, exists := variables[name]; exists {
-			// Then we don't want to apply the default for this variable as we
-			// already have a value.
+	cfgVariables := config.Module.Variables
+	testVariables := make(map[string]*configs.Variable)
+	for key, value := range cfgVariables {
+		testVariables[key] = value
+	}
+
+	for name, variable := range variables {
+		// If we have a definition for a variable already, then we are happy.
+		// But, if we find a variable with no definition then we'll just make
+		// one up.
+		if _, exists := testVariables[name]; exists {
 			continue
 		}
 
-		if variable.Default != cty.NilVal {
-			variables[name] = &terraform.InputValue{
-				Value:       variable.Default,
-				SourceType:  terraform.ValueFromConfig,
-				SourceRange: tfdiags.SourceRangeFromHCL(variable.DeclRange),
-			}
-		}
-	}
-
-	// Now we're going to do a some modifications to the config.
-	//
-	// If we have got variable values from the test file we need to make sure
-	// they have an equivalent entry in the configuration. We're going to do
-	// that dynamically here.
-
-	// First, take a backup of the existing configuration so we can easily
-	// restore it later.
-	currentVars := make(map[string]*configs.Variable)
-	for name, variable := range config.Module.Variables {
-		currentVars[name] = variable
-	}
-
-	// Next, let's go through our entire inputs and add any that aren't already
-	// defined into the config.
-	for name, value := range variables {
-		if _, exists := config.Module.Variables[name]; exists {
-			continue
-		}
-
-		config.Module.Variables[name] = &configs.Variable{
+		testVariables[name] = &configs.Variable{
 			Name:           name,
-			Type:           value.Value.Type(),
-			ConstraintType: value.Value.Type(),
-			DeclRange:      value.SourceRange.ToHCL(),
+			Type:           variable.Value.Type(),
+			ConstraintType: variable.Value.Type(),
+			DeclRange:      variable.SourceRange.ToHCL(),
 		}
 	}
 
-	// We return our input values, a function that will reset the variables
-	// within the config so it can be used again, and any diagnostics reporting
-	// variables that we couldn't parse.
-
-	return variables, func() {
-		config.Module.Variables = currentVars
+	config.Module.ProviderConfigs = testProviders
+	config.Module.Variables = testVariables
+	return func() {
+		// Reset the original config within the returned function.
+		config.Module.ProviderConfigs = cfgProviders
+		config.Module.Variables = cfgVariables
 	}, diags
 }
 

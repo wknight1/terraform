@@ -1126,15 +1126,6 @@ func TestTest_BadReferences(t *testing.T) {
 	expectedOut := `main.tftest.hcl... in progress
   run "setup"... pass
   run "test"... fail
-
-Warning: Value for undeclared variable
-
-  on main.tftest.hcl line 17, in run "test":
-  17:     input_three = run.madeup.response
-
-The module under test does not declare a variable named "input_three", but it
-is declared in run block "test".
-
   run "finalise"... skip
 main.tftest.hcl... tearing down
 main.tftest.hcl... fail
@@ -1177,6 +1168,94 @@ the current run block.
 	actualErr := output.Stderr()
 	if diff := cmp.Diff(actualErr, expectedErr); len(diff) > 0 {
 		t.Errorf("output didn't match expected:\nexpected:\n%s\nactual:\n%s\ndiff:\n%s", expectedErr, actualErr, diff)
+	}
+
+	if provider.ResourceCount() > 0 {
+		t.Errorf("should have deleted all resources on completion but left %v", provider.ResourceString())
+	}
+}
+
+func TestTest_UndefinedVariables(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "variables_undefined_in_config")), td)
+	defer testChdir(t, td)()
+
+	provider := testing_command.NewProvider(nil)
+	view, done := testView(t)
+
+	c := &TestCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(provider.Provider),
+			View:             view,
+		},
+	}
+
+	code := c.Run([]string{"-no-color"})
+	output := done(t)
+
+	if code == 0 {
+		t.Errorf("expected status code 0 but got %d", code)
+	}
+
+	expectedOut := ""
+	actualOut := output.Stdout()
+	if diff := cmp.Diff(actualOut, expectedOut); len(diff) > 0 {
+		t.Errorf("output didn't match expected:\nexpected:\n%s\nactual:\n%s\ndiff:\n%s", expectedOut, actualOut, diff)
+	}
+
+	expectedErr := `
+Error: Reference to undeclared input variable
+
+  on main.tf line 2, in resource "test_resource" "foo":
+   2:   value = var.input
+
+An input variable with the name "input" has not been declared. This variable
+can be declared with a variable "input" {} block.
+`
+	actualErr := output.Stderr()
+	if diff := cmp.Diff(actualErr, expectedErr); len(diff) > 0 {
+		t.Errorf("output didn't match expected:\nexpected:\n%s\nactual:\n%s\ndiff:\n%s", expectedErr, actualErr, diff)
+	}
+
+	if provider.ResourceCount() > 0 {
+		t.Errorf("should have deleted all resources on completion but left %v", provider.ResourceString())
+	}
+}
+
+func TestTest_VariablesInProviders(t *testing.T) {
+	td := t.TempDir()
+	testCopyDir(t, testFixturePath(path.Join("test", "variables_undefined_in_config")), td)
+	defer testChdir(t, td)()
+
+	provider := testing_command.NewProvider(nil)
+	view, done := testView(t)
+
+	c := &TestCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(provider.Provider),
+			View:             view,
+		},
+	}
+
+	code := c.Run([]string{"-no-color"})
+	output := done(t)
+
+	if code == 0 {
+		t.Errorf("expected status code 0 but got %d", code)
+	}
+
+	expected := `
+Error: Reference to undeclared input variable
+
+  on main.tf line 2, in resource "test_resource" "foo":
+   2:   value = var.input
+
+An input variable with the name "input" has not been declared. This variable
+can be declared with a variable "input" {} block.
+`
+	actual := output.All()
+	if diff := cmp.Diff(actual, expected); len(diff) > 0 {
+		t.Errorf("output didn't match expected:\nexpected:\n%s\nactual:\n%s\ndiff:\n%s", expected, actual, diff)
 	}
 
 	if provider.ResourceCount() > 0 {
